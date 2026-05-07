@@ -1,0 +1,5 @@
+* text=auto
+*.sh text eol=lf
+*.bash text eol=lf
+scripts/* text eol=lf
+.architect/log/.gitkeep text eol=lf

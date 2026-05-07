@@ -39,3 +39,8 @@ rebuttal/
 apps/
 *.sh
 run.py
+
+# Voxelo scaffold (architect coordination layer + deploy/bootstrap scripts).
+# Override upstream's `*.sh` ignore for our scripts/ dir.
+!scripts/*.sh
+!scripts/*.ps1
