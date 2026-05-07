@@ -69,7 +69,8 @@ if (-not (Get-Command runpodctl -ErrorAction SilentlyContinue)) {
 Log "Using runpodctl: $((Get-Command runpodctl).Source)"
 
 if (-not $env:HF_TOKEN) {
-    Die 'HF_TOKEN not set. `$env:HF_TOKEN = "<paste-hf-token>"` then re-run.'
+    Warn 'HF_TOKEN not set. Continuing without — TencentARC/FreeSplatter is public so anonymous download works.'
+    Warn '  If cycle 2 weight download fails or you switch to a gated model, run: $env:HF_TOKEN = "<paste>" then redeploy.'
 }
 
 # Auth: env var OR cached config (~/.runpod/config.toml)
@@ -266,10 +267,12 @@ if ($existingPod) {
 }
 
 # Build env JSON via PowerShell — never echo the value.
-$envJson = @{
-    HF_TOKEN = $env:HF_TOKEN
+# HF_TOKEN included only if set in the local shell.
+$envHash = @{
     PYTORCH_CUDA_ALLOC_CONF = 'expandable_segments:True'
-} | ConvertTo-Json -Compress
+}
+if ($env:HF_TOKEN) { $envHash['HF_TOKEN'] = $env:HF_TOKEN }
+$envJson = $envHash | ConvertTo-Json -Compress
 
 # PowerShell's legacy native-arg passing strips double quotes from arguments
 # bound for external .exe files. Escape each `"` as `\"` so the runpodctl
