@@ -158,24 +158,47 @@ if [[ "${DO_BUILD_KERNELS}" = "1" && ! -f "${INSTALL_SENTINEL}" ]]; then
     log "Step 6c: build backends pre-installed (avoids --no-build-isolation gotchas)"
     uv pip install hatchling pathspec editables setuptools wheel ninja packaging
 
-    log "Step 6d: filtering xformers out of requirements.txt and installing the rest"
+    log "Step 6d: split install — pure-pip deps first, then git+ kernels with --no-build-isolation"
     REQ_FILE="${REPO_DIR}/requirements.txt"
     if [[ ! -f "${REQ_FILE}" ]]; then
         warn "No requirements.txt at ${REQ_FILE}"
         exit 1
     fi
-    grep -v -E '^xformers' "${REQ_FILE}" > /tmp/req-noxformers.txt
-
-    # The 3 git+https packages (diff-gaussian-rasterization, diff-surfel-rasterization,
-    # nvdiffrast) compile CUDA kernels here. utils3d is pure Python.
+    # The 3 git+https kernel packages do `import torch` at setup.py load time,
+    # so uv's default isolated build env (which lacks torch) fails them with
+    # ModuleNotFoundError: No module named 'torch'. Solve by splitting:
+    # pure deps go through normal resolution; git+ packages run with
+    # --no-build-isolation against the venv (where torch is already installed
+    # from step 6a).
+    grep -v -E '^xformers' "${REQ_FILE}" | grep -v -E '^git\+' > /tmp/req-pure.txt
+    grep -E '^git\+' "${REQ_FILE}" > /tmp/req-git.txt
+    log "  Step 6d.1: $(wc -l < /tmp/req-pure.txt) pure-pip deps (normal isolation)"
+    uv pip install -r /tmp/req-pure.txt
+    log "  Step 6d.2: $(wc -l < /tmp/req-git.txt) git+ deps (--no-build-isolation; the 3 CUDA kernels compile here)"
     # NOTE: not setting TORCH_CUDA_ARCH_LIST — let nvcc auto-detect from the
     # pod's GPU. If GPU class changes later, delete the relevant site-packages
     # dirs and re-run with the sentinel removed.
-    uv pip install -r /tmp/req-noxformers.txt
-    rm -f /tmp/req-noxformers.txt
+    #
+    # gcc 13 / CUDA 12.8 fix: the diff-gaussian-rasterization and
+    # diff-surfel-rasterization headers use std::uintptr_t and uint32_t but
+    # only include <iostream>, <vector>, <cuda_runtime_api.h>. Newer libstdc++
+    # in gcc 13 doesn't transitively pull in <cstdint>, so compilation fails
+    # with `namespace "std" has no member "uintptr_t"`. Force-include cstdint
+    # via NVCC_PREPEND_FLAGS (applies to every nvcc call) and CXXFLAGS (applies
+    # to the host gcc calls torch's build_ext spawns).
+    export NVCC_PREPEND_FLAGS="${NVCC_PREPEND_FLAGS:-} -include cstdint"
+    export CXXFLAGS="${CXXFLAGS:-} -include cstdint"
+    uv pip install --no-build-isolation -r /tmp/req-git.txt
+    rm -f /tmp/req-pure.txt /tmp/req-git.txt
 
     log "Step 6e: hf_transfer (HF_HUB_ENABLE_HF_TRANSFER=1 is set in base images)"
     uv pip install hf_transfer
+
+    log "Step 6f: onnxruntime-gpu (rembg peer dep — upstream's requirements.txt is missing it)"
+    # rembg is in requirements.txt but it lazy-imports onnxruntime at module
+    # load time; importing freesplatter.utils.infer_util fails without it.
+    # Pick the GPU build since we're on a CUDA pod and rembg matmul is hot.
+    uv pip install onnxruntime-gpu
 
     touch "${INSTALL_SENTINEL}"
     log "Install + kernel build complete; sentinel: ${INSTALL_SENTINEL}"
