@@ -1,91 +1,101 @@
-# Cycle 1 — task
+# Cycle 2 — task
 
-**Date:** 2026-05-07
+**Date:** 2026-05-08
 **Set by:** architect
-**Cycle:** 1
+**Cycle:** 2
 
 ## Goal
 
-Stand up the FreeSplatter env on the pod via `scripts/bootstrap.sh`, prove the venv + 3 custom CUDA kernels build cleanly + the FreeSplatter Python package imports, then verify it survives a stop/start cycle.
-
-This is the **first instance of the bypass-conda (uv venv) variant** of `runpod-persistent-gpu-pod`. Lyra-2 was conda-based; this one isn't. If anything in the pattern breaks because of the bypass, surface it in the handoff so the pattern templates get updated.
+Download FreeSplatter weights (~0.9 GB) + pre-pull peer-model weights (`Tencent/Hunyuan3D-1` ~5 GB, `briaai/RMBG-2.0` ~1.5 GB) so cycle 3's `app.py` doesn't go to HF on first run. Smoke-test by instantiating `FreeSplatterModel` with each of the 3 configs and confirming forward-pass tensors flow without an explicit input image (just shape verification).
 
 ## Verification
 
 ```bash
-# 1. Bootstrap is idempotent + completes
-bash scripts/bootstrap.sh
-# expect: exits 0, "Bootstrap complete." last log line
+# 1. Sentinel check (post-download)
+test -f /workspace/.freesplatter-weights-complete && echo "sentinel OK"
 
-# 2. Activation script works
+# 2. FreeSplatter weights present
+ls -lh /workspace/weights/checkpoints/*.safetensors 2>/dev/null
+ls -lh /workspace/weights/*.safetensors 2>/dev/null
+# expect: 3 safetensors files for FreeSplatter-O, FreeSplatter-O-2dgs, FreeSplatter-S
+#         (~300 MB each)
+
+# 3. Hunyuan3D-1 + RMBG-2.0 in HF cache
+ls /workspace/hf-cache/hub/ 2>/dev/null | head
+# expect: models--Tencent--Hunyuan3D-1, models--briaai--RMBG-2.0
+
+# 4. Smoke test — load each FreeSplatter config and check forward pass shape
 source /workspace/activate.sh
-# expect: which python -> /workspace/envs/freesplatter/bin/python
+python <<'EOF'
+import torch
+from omegaconf import OmegaConf
+from freesplatter.models.model import FreeSplatterModel
 
-# 3. Torch + CUDA
-python -c "import torch; print(torch.__version__, torch.cuda.is_available(), torch.version.cuda)"
-# expect: 2.4.0+cu121 True 12.1
-
-# 4. xformers (note: must be 0.0.27.post2 for torch 2.4.0; the requirements.txt
-#    pin of 0.0.22.post7 is wrong — README's 0.0.27.post2 is correct).
-python -c "import xformers; print(xformers.__version__)"
-# expect: 0.0.27.post2
-
-# 5. The 3 custom CUDA kernels imported successfully
-python -c "import diff_gaussian_rasterization; import diff_surfel_rasterization; import nvdiffrast.torch as dr; print('kernels OK')"
-# expect: "kernels OK"
-
-# 6. FreeSplatter package imports
-#    (Note: actual class is FreeSplatterModel, not FreeSplatter — corrected
-#    post-cycle-1 after pod-shell surfaced the name mismatch.)
-python -c "from freesplatter.models.model import FreeSplatterModel; print('FreeSplatterModel import OK')"
-# expect: "FreeSplatterModel import OK"
-
-# 7. STOP pod from RunPod console, START again, re-attach tmux, then:
-source /workspace/activate.sh
-# Re-run steps 3, 5, 6. All must pass with the same outputs.
+for cfg_name in ['freesplatter-object', 'freesplatter-object-2dgs', 'freesplatter-scene']:
+    cfg = OmegaConf.load(f'configs/{cfg_name}.yaml')
+    model = FreeSplatterModel(**cfg.model.params).cuda().eval()
+    # Try to load the matching checkpoint
+    print(f'OK: {cfg_name} instantiated, params={sum(p.numel() for p in model.parameters())/1e6:.1f}M')
+EOF
+# expect: 3 lines "OK: <name> instantiated, params=~306M" each
 ```
 
 ## Scope
 
 **In scope:**
-- `scripts/bootstrap.sh`
-- `scripts/install-pod-claude.sh` (only if optional autonomous mode is needed; default mode skips this)
-- `/workspace/activate.sh` (written by bootstrap)
-- `/workspace/envs/freesplatter/` (the venv)
-- `.architect/log/` and `.architect/handoff.md`
+- `/workspace/.freesplatter-weights-complete` sentinel (created by bootstrap)
+- `/workspace/weights/` contents
+- `/workspace/hf-cache/` contents
+- `.architect/log/2026-05-08-cycle-02.md`
+- `.architect/handoff.md`
+- `scripts/bootstrap.sh` — only if a real bug surfaces in the weights phase that needs fixing
 
 **Out of scope:**
-- Editing upstream code in `freesplatter/`, `configs/`, `app.py` — leave alone.
-- Downloading model weights — that's cycle 2.
-- Running `app.py` — that's cycle 2/3.
-- Any GCC version pinning — system gcc on the base image works for these kernels (no upstream pin specified).
+- Modifying the FreeSplatter `freesplatter/` package
+- Running `app.py` (that's cycle 3 — interactive gradio over SSH tunnel)
+- Editing `configs/*.yaml`
+- Anything outside `/workspace/`
 
 ## Prior context
 
-Lyra-2 (the first pattern instance) ran the conda path and surfaced ~15 issues. The bypass-conda decision (`Architect/decisions/2026-05-05-bypass-conda.md`) was deferred to "next repo" — that's this one. Expectations:
+Cycle 1 closed clean (handoff in `.architect/handoff.md`, log in `.architect/log/2026-05-08-cycle-01.md`). Pod stopped + started cleanly; bootstrap re-run = 14s no-op; pre/post-restart re-verify all green.
 
-- No `conda tos accept` friction.
-- No `nothing provides __win` channel mismatch.
-- No `LibMambaUnsatisfiableError`.
-- uv venv creation < 30s.
-- `uv pip install -r requirements.txt` faster than conda's pip.
-- Custom kernel builds (3 of them) total ~5-10 min on A40.
+**Key thing to remember from cycle 1:** SSH port may change on stop/start. The pod was just resumed for cycle 2 — pod-shell, refresh SSH details before connecting if you don't already have a fresh poll.
 
-If any of those go sideways, log the surprise.
+## Steps in order
+
+1. **SSH in, recreate tmux session `arch`** (it was wiped on the cycle-1 close stop).
+2. **`source /workspace/activate.sh`**, verify `which python` lands at `/workspace/envs/freesplatter/bin/python`.
+3. **`git pull origin voxelo/main`** in `/workspace/FreeSplatter` to pick up the post-cycle-1 commits (spec correction `b0d440b`, deploy.ps1 fixes + RECIPE `b34b763`).
+4. **Pull FreeSplatter weights** by re-running bootstrap with the weights flag:
+   ```
+   FREESPLATTER_DOWNLOAD_WEIGHTS=1 bash scripts/bootstrap.sh
+   ```
+   Should be near-instant for everything except step 7 (the weights download). Watch for the new sentinel at `/workspace/.freesplatter-weights-complete`.
+
+5. **Pre-pull peer models** into the HF cache (they auto-load at app.py first-run; pre-pulling makes cycle 3 fast):
+   ```
+   HF_HOME=/workspace/hf-cache hf download Tencent/Hunyuan3D-1 --include "*.safetensors" "*.json" "*.bin" "config.json"
+   HF_HOME=/workspace/hf-cache hf download briaai/RMBG-2.0
+   ```
+
+6. **Smoke test** — instantiate the 3 FreeSplatterModel configs as in verification check 4 above. Each should report ~306M params and not crash.
+
+7. **Write cycle 2 handoff.** Status: `done` if all 4 checks pass; `blocked` with details if anything fails.
 
 ## Open questions
 
-- **`xformers` version conflict.** `requirements.txt` pins `xformers==0.0.22.post7` (incompatible with torch 2.4.0). README pins `0.0.27.post2`. Bootstrap installs `0.0.27.post2` BEFORE `pip install -r requirements.txt` and filters xformers out of requirements.txt. Verify this works; if not, alternative is `pip install --no-deps -r requirements.txt`.
-- **`TORCH_CUDA_ARCH_LIST`.** Bootstrap doesn't set it explicitly — relies on `nvcc` auto-detecting the present GPU (A40, sm_86). If we ever switch GPU class we'll need to rebuild the 3 kernels. Note this in the handoff.
-- **`Hunyuan3D-1` and `RMBG-2.0` weights.** Used by inference, lazy-loaded on first run from HF. Cycle 1 doesn't touch them. Cycle 2 may want to pre-pull.
+- **Hunyuan3D-1 size.** README doesn't pin a size; could be 5 GB or 15 GB. Watch `df -h /workspace` during download — we have 100 GB total, ~2 GB used after cycle 1, so there's headroom but let me know if it's >20 GB.
+- **Smoke test config keys.** `cfg.model.params` is a guess — if the YAML schema differs (e.g. `cfg.model.config` or just `cfg.params`), use whatever the actual key is and note in handoff.
+- **`.safetensors` vs `.bin` weight format.** I assumed `.safetensors`; if FreeSplatter ships `.bin` or `.pt`, adjust the verification listing.
 
 ## Constraints
 
-- A40 GPU at $0.39/hr — keep cycle 1 under 2 GPU-hours of total wall time.
-- Don't pre-download the FreeSplatter weights yet; cycle 2 owns weights.
-- Don't run `pip install` outside the venv. Always `source /workspace/activate.sh` first; verify with `which python`.
+- Cycle 2 budget: under 1 GPU-hour (~$0.50 spend ceiling on A6000).
+- Don't re-build the kernels — sentinel `INSTALL_SENTINEL` should keep them skipped. If for some reason it doesn't, surface and stop.
+- Don't run `app.py` — that's cycle 3.
 
 ## Notes
 
-- This is the first uv-venv instance of the pattern. Take notes — anything that surprises us lifts to the pattern templates.
-- Quick test command for later cycles: `python app.py` (Gradio demo on port 7860; tunnel via SSH `-L 7860:localhost:7860` for access from the laptop).
+- HF_TOKEN isn't set in the pod env. All 3 models (TencentARC/FreeSplatter, Tencent/Hunyuan3D-1, briaai/RMBG-2.0) appear public; anonymous downloads should work. If any prompts for auth, surface and stop.
+- Hugging Face's `hf` CLI is what bootstrap uses (not the deprecated `huggingface-cli`); both are installed via the venv.
