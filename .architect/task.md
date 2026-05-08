@@ -35,8 +35,10 @@ python -c "import diff_gaussian_rasterization; import diff_surfel_rasterization;
 # expect: "kernels OK"
 
 # 6. FreeSplatter package imports
-python -c "from freesplatter.models.model import FreeSplatter; print('FreeSplatter import OK')"
-# expect: "FreeSplatter import OK"
+#    (Note: actual class is FreeSplatterModel, not FreeSplatter — corrected
+#    post-cycle-1 after pod-shell surfaced the name mismatch.)
+python -c "from freesplatter.models.model import FreeSplatterModel; print('FreeSplatterModel import OK')"
+# expect: "FreeSplatterModel import OK"
 
 # 7. STOP pod from RunPod console, START again, re-attach tmux, then:
 source /workspace/activate.sh
