@@ -209,6 +209,92 @@ else
 fi
 
 # ─────────────────────────────────────────────────────────────
+# 6.5. Cycle-3 runtime patches (idempotent; run every boot to survive
+#      venv reinstalls or accidental file deletions).
+#
+#      Three issues surfaced in cycle 3 that block app.py launch and need
+#      runtime fixes vs install-time fixes:
+#
+#      a) HF custom-pipeline modules cache: app.py uses ./ckpts/ (relative)
+#         for model weights, but diffusers' dynamic-pipeline machinery
+#         writes ITS python files under HF_MODULES_CACHE. With HF_HOME on
+#         /workspace, paths are correct, but `init_hf_modules` doesn't
+#         always re-add the cache dir to sys.path before import. Fix: a
+#         .pth file in site-packages adds it permanently.
+#
+#      b) gradio==5.5.0 + gradio_client API introspection has a bug where
+#         JSON Schema's `additionalProperties: True` (a bool) is passed as
+#         a "schema" but `get_type` and `_json_schema_to_python_type`
+#         expect a dict. Both crash. We patch them to short-circuit on
+#         bool input. This will survive pip reinstall of gradio_client
+#         only if not pinned in requirements; a hardened version would
+#         pin a known-good gradio_client version instead.
+#
+#      c) tab_img_to_3d.py / tab_views_to_*.py reference `examples/<dir>`
+#         relative to repo root. Upstream's .gitignore excludes
+#         `examples/` so the fork doesn't have them. mkdir empty dirs.
+# ─────────────────────────────────────────────────────────────
+log "Step 6.5: cycle-3 runtime patches (HF .pth, gradio_client bool guards, examples dirs)"
+
+# 6.5a — .pth file: auto-adds /workspace/hf-cache/modules to sys.path
+PTH_FILE="${ENV_DIR}/lib/python${PYTHON_VERSION}/site-packages/_hf_modules_path.pth"
+if [[ ! -f "${PTH_FILE}" ]]; then
+    echo "${WORKSPACE}/hf-cache/modules" > "${PTH_FILE}"
+    log "  wrote ${PTH_FILE}"
+fi
+
+# 6.5b — gradio_client bool-schema patches (idempotent)
+GC_UTILS="${ENV_DIR}/lib/python${PYTHON_VERSION}/site-packages/gradio_client/utils.py"
+if [[ -f "${GC_UTILS}" ]]; then
+    python <<PYEOF
+F = "${GC_UTILS}"
+with open(F) as f: t = f.read()
+patched = False
+
+# Patch 1: get_type — guard against bool schema
+old1 = 'def get_type(schema: dict):\n    if "const" in schema:'
+new1 = 'def get_type(schema: dict):\n    if not isinstance(schema, dict):\n        return None\n    if "const" in schema:'
+if new1.split('\n')[1].strip() not in t and old1 in t:
+    t = t.replace(old1, new1); patched = True
+
+# Patch 2: _json_schema_to_python_type — short-circuit bool
+old2 = 'def _json_schema_to_python_type(schema: Any, defs) -> str:\n    """Convert the json schema into a python type hint"""\n    if schema == {}:\n        return "Any"'
+new2 = 'def _json_schema_to_python_type(schema: Any, defs) -> str:\n    """Convert the json schema into a python type hint"""\n    if isinstance(schema, bool):\n        return "Any"\n    if schema == {}:\n        return "Any"'
+if 'if isinstance(schema, bool):\n        return "Any"\n    if schema == {}' not in t and old2 in t:
+    t = t.replace(old2, new2); patched = True
+
+if patched:
+    with open(F, "w") as f: f.write(t)
+    print("[6.5b] gradio_client patched")
+else:
+    print("[6.5b] gradio_client already patched (or pattern moved upstream)")
+PYEOF
+fi
+
+# 6.5c — empty examples dirs so gr.Examples() doesn't crash on missing path
+if [[ -d "${REPO_DIR}" ]]; then
+    mkdir -p "${REPO_DIR}/examples/img_to_3d" \
+             "${REPO_DIR}/examples/views_to_3d" \
+             "${REPO_DIR}/examples/views_to_scene" \
+             "${REPO_DIR}/examples/text_to_img_to_3d" \
+             "${REPO_DIR}/examples/instant3d" \
+             "${REPO_DIR}/examples/text_to_3d"
+    log "  examples/* dirs ensured (empty is fine, gradio renders no-examples panel)"
+fi
+
+# 6.5d — symlink ckpts/ -> /workspace/ckpts so peer models (Hunyuan3D-1
+#        ~16 GB, RMBG-2.0 ~849 MB, zero123plus-v1.1/v1.2 ~9 GB) live on
+#        the persistent volume. app.py uses cache_dir="ckpts/" (relative)
+#        which would otherwise create the dir in the repo root and not
+#        survive volume migration.
+mkdir -p "${WORKSPACE}/ckpts"
+if [[ -d "${REPO_DIR}" && ! -L "${REPO_DIR}/ckpts" ]]; then
+    rm -rf "${REPO_DIR}/ckpts" 2>/dev/null
+    ln -sfn "${WORKSPACE}/ckpts" "${REPO_DIR}/ckpts"
+    log "  ${REPO_DIR}/ckpts -> ${WORKSPACE}/ckpts"
+fi
+
+# ─────────────────────────────────────────────────────────────
 # 7. Model weights — sentinel-gated. Default OFF (cycle 2 turns it on).
 # ─────────────────────────────────────────────────────────────
 if [[ "${DO_DOWNLOAD_WEIGHTS}" = "1" && ! -f "${WEIGHTS_SENTINEL}" ]]; then

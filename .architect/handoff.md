@@ -1,60 +1,70 @@
-# Cycle 2 — handoff
+# Cycles 1-3 — final handoff (recipe locked)
 
+**Status:** `done`
 **Date:** 2026-05-08
-**Status:** `in-progress` — partial. FreeSplatter weights + smoke test green; peer-model pre-pull blocked on gated repo + spec issues. Architect call needed before cycle 3.
+**Pattern:** runpod-persistent-gpu-pod (bypass-conda variant) — pattern instance #2 fully tested.
 
-## What worked
+## TL;DR
 
-- **Pod connect + state restore.** Fresh pod `com3tlvpfgnmmk` at `64.247.206.204:34045`. Volume `ehtswxltst` reattached cleanly. All cycle-1 artefacts intact (venv, kernels, sentinels, `/workspace/.ssh-state/`). SSH key re-installed at `/root/.ssh/pod_id_ed25519`, GitHub auth confirmed (`Hi visualvlad!`). tmux `arch` recreated.
-- **Repo pulled** to `26c89b8`.
-- **FreeSplatter weights downloaded.** `FREESPLATTER_DOWNLOAD_WEIGHTS=1 bash scripts/bootstrap.sh`: steps 1-6 sentinel-skipped, step 7 pulled 3.6 GB total via `huggingface-cli`. Sentinel `/workspace/.freesplatter-weights-complete` written.
-- **Smoke test passed.** All 3 configs (`freesplatter-object`, `freesplatter-object-2dgs`, `freesplatter-scene`) instantiate cleanly via `FreeSplatterModel(**cfg.model.params).cuda().eval()` — 307.9M params each. `cfg.model.params` schema guess was correct.
+All three cycles closed. Object mode + scene mode end-to-end inference verified by Vlad through Gradio at `http://localhost:7860` (SSH tunnel `-L 7860:localhost:41137`). Recipe is locked in `.architect/RECIPE.md`. Pod stopped. Total spend across all cycles: ~$3.50.
 
-## What didn't work — peer-model pre-pull
+## Cycle outcomes
 
-The peer-model pre-pull as specified in cycle-2 task.md is **wrong on multiple axes**. None of these are pod-shell mistakes; they're spec issues to fix before cycle 3.
+| cycle | status | notes |
+|---|---|---|
+| 1 | done (2026-05-08, ~2h, ~$1) | env health + stop/start verified. 5 pattern bugs banked → bootstrap.sh patched. |
+| 2 | done (2026-05-08, ~30m, ~$0.30) | FreeSplatter weights (3.5 GB) + 3-config smoke test green. Peer-pull deferred to lazy-load in cycle 3. |
+| 3 | done (2026-05-08, ~4h, ~$2) | App.py launched, both inference modes verified. 4 layers of gradio fixes. Recipe locked. |
 
-1. **`briaai/RMBG-2.0` is gated.** `GatedRepoError: 401 Client Error`. Anonymous downloads do not work — task.md said this would. Need HF_TOKEN with prior gated-access acceptance for that repo. Per task.md instruction If something prompts for auth, surface and stop, I stopped.
+## What was proven
 
-2. **Wrong cache destination.** `app.py` calls `snapshot_download('tencent/Hunyuan3D-1', repo_type='model', local_dir='./ckpts/Hunyuan3D-1')` and `webui/runner.py` uses `cache_dir='ckpts/'` (relative to FreeSplatter repo root). Pre-pulling into `HF_HOME=/workspace/hf-cache` does NOT prevent re-download in cycle 3 — app.py uses `local_dir`/`cache_dir` not `HF_HOME`.
+- Bypass-conda variant works end-to-end (uv venv, system gcc, system CUDA, no conda).
+- Stop/start preserves env (14s no-op bootstrap re-run on warm cache).
+- Pod resume recovery: when `runpodctl pod start` fails with "not enough free GPUs on host machine", `pod remove` + redeploy gets a fresh host in the same DC, volume reattaches cleanly.
+- App.py + Gradio + 4 chained model pipelines (zero123plus-v1.1/v1.2 + Hunyuan3D-1 + FreeSplatterModel + RMBG-2.0) all run on a single A6000 at peak ~24 GB / 48 GB.
 
-3. **Include filter doesn't recurse.** `huggingface-cli download Tencent/Hunyuan3D-1 --include '*.safetensors'` matched only root-level files (none of which exist as safetensors); the actual safetensors live under `mvd_lite/`, `mvd_std/`, `svrm/`. fnmatch `*` doesn't cross `/`. Would need `**/*.safetensors` or drop the filter.
+## Issues hit + fixes (all banked into bootstrap.sh § 6.5 + Architect templates)
 
-4. **Peer-model list is incomplete.** `webui/runner.py` also loads:
-   - `sudo-ai/zero123plus-v1.1` (with `custom_pipeline="sudo-ai/zero123plus-pipeline"`)
-   - `sudo-ai/zero123plus-v1.2`
-   - `./ckpts/Hunyuan3D-1/mvd_std` subdir specifically (full repo not needed; only `mvd_std/` for the std pipeline)
+### Cycle 1 (bypass-conda first instance)
+1. uv `--no-build-isolation` needed for git+ kernel packages (torch invisible to isolated build venv).
+2. gcc 13 / CUDA 12.8 needs `NVCC_PREPEND_FLAGS=-include cstdint` + `CXXFLAGS=-include cstdint` for `diff-*-rasterization`.
+3. `rembg` lazy-imports `onnxruntime` — pre-install `onnxruntime-gpu`.
+4. Architect-side spec error: `task.md` referenced `FreeSplatter` class; actual is `FreeSplatterModel`.
+5. RunPod re-issues SSH ports on pod stop/start (IP usually persists). Always re-fetch via `runpodctl pod get`.
 
-5. **Bootstrap-emitted spec drift.** Cycle-2 task.md verification listing has `/workspace/weights/checkpoints/*.safetensors` — actual is `/workspace/weights/*.safetensors` (no `checkpoints/` subdir).
+### Cycle 2 (architect-owned task.md spec issues)
+6. App.py uses `cache_dir="ckpts/"` (relative repo dir), NOT `HF_HOME`. Pre-pull plan was wrong.
+7. HF CLI `--include "*.safetensors"` doesn't recurse subdirs. Use `**/*.safetensors` or omit.
+8. Peer model list incomplete — `sudo-ai/zero123plus-v1.1` AND `v1.2` both needed.
+9. `briaai/RMBG-2.0` is gated — need HF_TOKEN + account-level Accept Terms.
+10. `/workspace/weights/checkpoints/` path was wrong — FreeSplatter writes flat to `/workspace/weights/`.
 
-## Decisions I made (within my lane)
+### Cycle 3 (gradio launch — 4 layers)
+11. `ModuleNotFoundError: diffusers_modules` — `init_hf_modules` doesn't reliably add `HF_MODULES_CACHE` to sys.path. Fix: `.pth` file in venv site-packages.
+12. `FileNotFoundError: examples/img_to_3d` — upstream's `.gitignore` excludes `examples/`. Fix: `mkdir -p` 6 empty dirs.
+13. `TypeError: argument of type 'bool' is not iterable` in `gradio_client/utils.py:880 get_type` — newer JSON Schema `additionalProperties: True` reaches code that expects dict. Fix: `if not isinstance(schema, dict): return None`.
+14. `APIInfoParseError: Cannot parse schema True` in `_json_schema_to_python_type` — same bool root cause but recursive code path. Fix: short-circuit on bool.
 
-- Stopped peer-pull as soon as RMBG-2.0 hit GatedRepoError, per surface and stop instruction.
-- Did NOT try to set `HF_TOKEN` myself (auth secret = architect/Vlad's call).
-- Did NOT retry Hunyuan3D-1 with a fixed include pattern, because the destination is also wrong — partial fix would still be wrong.
-- Smoke test executed regardless because the 3 configs are self-contained — no peer model needed for FreeSplatterModel instantiation.
+### Security
+15. **Token leak**: pod-shell echoed HF_TOKEN to chat while debugging a CRLF parse error in `/root/.hf-secret` (used `cat -A` on a known-secret file). Token rotated by Vlad. Lifted to `pod-shell.md`: never `cat`/`cat -A`/`od` on secret files.
 
-## What architect needs to decide before cycle 3
+## Pod state at close
 
-1. **HF_TOKEN provisioning.** Set `HF_TOKEN` in pod env (or write to `/root/.cache/huggingface/token` via `huggingface-cli login`). Vlad's HF account also needs to have accepted gated access for `briaai/RMBG-2.0` (one-time at https://huggingface.co/briaai/RMBG-2.0 while logged in).
-2. **Rewrite peer-pull strategy.** Either:
-   - (a) skip peer pre-pull entirely — let `app.py` populate `./ckpts/` on first run (cycle 3 will be slow but correct), OR
-   - (b) pre-pull to the correct destinations: `huggingface-cli download tencent/Hunyuan3D-1 --local-dir /workspace/FreeSplatter/ckpts/Hunyuan3D-1` (specifically for the `mvd_std` subset if you want to save disk), and use `cache_dir=/workspace/FreeSplatter/ckpts` for the snapshot downloads of RMBG-2.0 + zero123plus.
-3. **Patch cycle-2 task.md template** for future repos: drop `checkpoints/` from the FreeSplatter weights listing.
-4. **Possible `pod-shell-prep.sh`.** The `/root/.ssh/pod_id_ed25519` restore + git core.sshCommand setup is currently manual (3 commands). Lyra's `install-pod-claude.sh` automates this via `init-pod.sh`. Bypass-conda variant doesn't ship that. Could be a tiny script next to `scripts/bootstrap.sh` that the operator runs first thing on a fresh pod, OR baked into bootstrap.sh as an idempotent first step (with the heuristic if /workspace/.ssh-state/ exists, restore it). Not blocking, but a recurring tax.
+- **Pod**: `com3tlvpfgnmmk` (stopped). Resume with `runpodctl pod start com3tlvpfgnmmk`. SSH port may change on resume — re-fetch.
+- **Volume**: `ehtswxltst` (100 GB MFS in US-KS-2, ~47% used: envs 14 GB, weights 3.5 GB, ckpts 29 GB, hf-cache 12 MB, outputs 72 MB). Idle cost ~$7/mo until deleted.
+- **GitHub**: per-pod ed25519 pubkey `voxelo-runpod-jxnu5fpi95j9gy-2026-05-08` is in Vlad's account-level keys. Persists across pods.
 
-## Open questions
+## Next-cycle suggestion
 
-- Cycle 1's `task.md` listed Hunyuan3D-1 as ~5 GB. Hunyuan3D-1 actually contains BOTH `mvd_lite/` AND `mvd_std/` (each ~5 GB at first glance — full repo could be 10-15 GB). Pre-pulling only `mvd_std/` saves disk. Architect to decide if `mvd_lite/` is also needed.
-- Disk: `/workspace` MFS shows volume-wide 67% used; the per-pod 100GB quota counter isn't visible via `df`. Hunyuan3D-1 + RMBG-2.0 + zero123plus-v1.1 + zero123plus-v1.2 could push us over. Worth a check via runpod console or a `du -sh /workspace/*` audit before pulling.
+None. Recipe locked. If FreeSplatter is needed again:
+1. `runpodctl pod start com3tlvpfgnmmk` (fresh pod from same volume) OR `deploy.ps1 -GpuId 'NVIDIA RTX A6000' -DataCenter US-KS-2` (if old pod is gone).
+2. `bash scripts/bootstrap.sh` — should be a 14s no-op verifying everything's intact, plus the 6.5 runtime patches re-apply.
+3. `source /workspace/activate.sh && cd /workspace/FreeSplatter && python app.py`
+4. From local: `ssh -L 7860:localhost:41137 ...` then http://localhost:7860.
 
 ## Pointers
 
-- Log: `.architect/log/2026-05-08-cycle-02.md`
-- Files written/changed:
-  - `/workspace/weights/{freesplatter-object,freesplatter-object-2dgs,freesplatter-scene}.safetensors` (1.23 GB each)
-  - `/workspace/.freesplatter-weights-complete` (sentinel)
-  - `/workspace/hf-cache/hub/models--Tencent--Hunyuan3D-1/` (only `config.json`; cleanup candidate)
-  - `/root/.ssh/pod_id_ed25519` (restored, ephemeral)
-  - `/workspace/FreeSplatter/_smoke.py` (smoke test artefact, leave for now)
-- Next cycle: cycle 3 = gradio app boot + image-to-3D inference round-trip. Blocked on the HF_TOKEN + peer-pull-strategy decisions above.
+- Recipe: `.architect/RECIPE.md`
+- Per-cycle logs: `.architect/log/2026-05-08-cycle-0{1,2,3}.md`
+- Smoke script: `.architect/scripts/smoke_configs.py`
+- Architect-side learnings: `Architect/decisions/2026-05-08-bypass-conda-tested.md`, `Architect/memory/playbook_repo_deploy.md`, `Architect/memory/in_flight_freesplatter_deploy.md`

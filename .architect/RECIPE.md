@@ -1,8 +1,8 @@
 # RECIPE — FreeSplatter on RunPod A6000 with persistent volume
 
-**Status:** tested 2026-05-08. Cycle 1 (env health + stop/start) reproducible in ~30 min build + ~$1 of compute. Cycles 2-3 (weights + inference) ahead.
+**Status:** LOCKED 2026-05-08. All 3 cycles passed end-to-end. Reproducible in ~5 hours total wall + ~$3.50 compute. Object mode + scene mode inference verified by Vlad through Gradio.
 
-This is the locked, reproducible recipe for getting TencentARC's FreeSplatter running on a RunPod GPU pod with a persistent network volume that survives stop/start. Built and verified through cycle 1 of the bypass-conda variant of `runpod-persistent-gpu-pod`.
+This is the locked, reproducible recipe for getting TencentARC's FreeSplatter running on a RunPod GPU pod with a persistent network volume that survives stop/start. Built and verified through 3 cycles of the bypass-conda variant of `runpod-persistent-gpu-pod`.
 
 ## Prerequisites (one-time, on your laptop)
 
@@ -140,37 +140,86 @@ git push   # should not prompt
 
 After stop/start, `/root/.ssh/pod_id_ed25519` is wiped (ephemeral). Restore from `/workspace/.ssh-state/`. The Lyra `init-pod.sh` template handles this auto for autonomous mode; for pod-shell mode, restore manually as part of post-restart setup.
 
-## Cycles 2-3 (ahead, not yet locked)
-
-### Cycle 2 (weights + smoke test)
+## Cycle 2 — FreeSplatter weights (~30 min, ~$0.30)
 
 ```bash
 cd /workspace/FreeSplatter
 FREESPLATTER_DOWNLOAD_WEIGHTS=1 bash scripts/bootstrap.sh
-# Downloads ~0.9 GB from TencentARC/FreeSplatter (3 checkpoint variants)
-
-# Optionally pre-pull lazy-loaded peer models so app.py first-run is fast
-HF_HOME=/workspace/hf-cache hf download Tencent/Hunyuan3D-1
-HF_HOME=/workspace/hf-cache hf download briaai/RMBG-2.0
+# Pulls 3.5 GB from TencentARC/FreeSplatter to /workspace/weights/
+# (3 .safetensors files, NOT a checkpoints/ subdir)
 ```
 
-### Cycle 3 (gradio demo end-to-end)
+Verify (3-config smoke):
 
 ```bash
 source /workspace/activate.sh
-cd /workspace/FreeSplatter
-python app.py
-# Tunnel from laptop: ssh -i ~/.ssh/RunPod-Key-Go -p <port> -L 7860:localhost:7860 root@<ip>
+python <<EOF
+from omegaconf import OmegaConf
+from freesplatter.models.model import FreeSplatterModel
+for cfg_name in ['freesplatter-object', 'freesplatter-object-2dgs', 'freesplatter-scene']:
+    cfg = OmegaConf.load(f'configs/{cfg_name}.yaml')
+    model = FreeSplatterModel(**cfg.model.params).cuda().eval()
+    print(f'OK: {cfg_name} {sum(p.numel() for p in model.parameters())/1e6:.1f}M')
+# expect: 3 lines "OK: <name> 307.9M"
+EOF
 ```
 
-Cycle 3 will lock the inference recipe once Vlad signs off the gradio demo running cleanly on real input.
+**Don't bother pre-pulling peer models.** App.py uses `cache_dir="ckpts/"` (relative repo dir); pre-pulling into `HF_HOME` doesn't help. Cycle 3's first launch lazy-pulls them automatically.
+
+## Cycle 3 — Gradio end-to-end (~5-10 min cold first launch, ~3 min subsequent)
+
+### Prerequisites for inference
+
+- **HF_TOKEN provisioned on the pod** (only required if peer models include gated repos like `briaai/RMBG-2.0`):
+
+  ```powershell
+  # On laptop, in the same shell where $env:HF_TOKEN is set:
+  "export HF_TOKEN='$($env:HF_TOKEN.Trim())'`n" | ssh -i $env:USERPROFILE\.runpod\ssh\RunPod-Key-Go -p <port> root@<ip> 'cat | tr -d "\r" > /root/.hf-secret && chmod 600 /root/.hf-secret'
+  ```
+
+  Use `tr -d "\r"` on the receive side to strip Windows CRLF; otherwise `source /root/.hf-secret` parses incorrectly.
+- **You must accept gated terms account-side** at https://huggingface.co/briaai/RMBG-2.0 before first launch. Anonymous access fails.
+
+### Launch
+
+```bash
+# On the pod
+tmux new -s arch
+source /workspace/activate.sh
+source /root/.hf-secret      # if HF_TOKEN provisioned
+cd /workspace/FreeSplatter
+python app.py 2>&1 | tee /tmp/app.log
+# Wait for: "Running on local URL:  http://0.0.0.0:41137"
+# Cold first launch: ~5-10 min (lazy-pulls Hunyuan3D-1 ~16 GB, RMBG-2.0 ~849 MB,
+#   sudo-ai/zero123plus-v1.1 ~3.6 GB, v1.2 ~5.3 GB into /workspace/ckpts/).
+# Warm subsequent launches: ~3 min.
+```
+
+### Tunnel from laptop
+
+App.py hardcodes port 41137 (not 7860):
+
+```powershell
+ssh -i $env:USERPROFILE\.runpod\ssh\RunPod-Key-Go -p <port> -N -L 7860:localhost:41137 root@<ip>
+```
+
+Open `http://localhost:7860` in your browser.
+
+### Verify both modes
+
+- **Image-to-3D tab** (FreeSplatter-O): drag-drop a single object image → Run → 3D Gaussian splat output rendered to a video.
+- **Sparse-view-to-Scene tab** (FreeSplatter-S): upload 4 multi-view images of a scene → Run → 3D scene Gaussians.
+
+Peak GPU memory measured during cycle 3 verification: **24.2 GB / 48 GB** on A6000.
 
 ## Cost reference
 
 - Volume idle (100 GB in US-KS-2): ~$7/mo
 - Pod compute when running: $0.49/hr A6000 Secure Cloud
-- Cycle 1 burn: ~$1.00 (proven 2026-05-08)
-- Build phase cold-cache: ~$0.30 in compute (5 min)
+- Cycle 1 burn (env build): ~$1.00 (proven 2026-05-08)
+- Cycle 2 burn (weights): ~$0.30
+- Cycle 3 burn (gradio + 4 layers of debug): ~$2.00 (this includes all the yak-shaving; a clean redeploy with the patched bootstrap.sh should cost ~$0.50)
+- **Total proven**: ~$3.50 for first deploy + verify; **~$1.80 for clean redeploy**.
 
 ## Known constraints
 
