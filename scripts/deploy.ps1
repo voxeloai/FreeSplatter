@@ -34,7 +34,12 @@ param(
     [int]    $VolumeSizeGB   = $(if ($env:VOLUME_SIZE_GB)  { [int]$env:VOLUME_SIZE_GB }  else { 100 }),
     [string] $GpuId          = $(if ($env:GPU_ID)          { $env:GPU_ID }          else { 'NVIDIA A40' }),
     [int]    $GpuCount       = $(if ($env:GPU_COUNT)       { [int]$env:GPU_COUNT }  else { 1 }),
-    [string] $PodImage       = $(if ($env:POD_IMAGE)       { $env:POD_IMAGE }       else { 'runpod/pytorch:2.7.1-py3.10-cuda12.8.0-devel-ubuntu22.04' }),
+    # Tag schema: 1.0.X-cuXXXX-torchYYY-ubuntuYYYY. Cycle 1 surfaced that the
+    # upstream-style "2.7.1-py3.10-cuda12.8.0-devel-ubuntu22.04" tag does NOT
+    # exist on Docker Hub — pod hangs in container-create loop ("manifest
+    # unknown"). 1.0.2-cu1281-torch280-ubuntu2404 is what Lyra-2 (and now
+    # FreeSplatter cycle 1) verified to work.
+    [string] $PodImage       = $(if ($env:POD_IMAGE)       { $env:POD_IMAGE }       else { 'runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404' }),
     [int]    $ContainerDiskGB= $(if ($env:CONTAINER_DISK_GB){ [int]$env:CONTAINER_DISK_GB } else { 50 }),
     [string] $DataCenter     = $(if ($env:DATA_CENTER_ID)  { $env:DATA_CENTER_ID }  else { 'auto' }),
     [ValidateSet('SECURE','COMMUNITY')]
@@ -59,6 +64,39 @@ try { $PSNativeCommandArgumentPassing = 'Legacy' } catch {}
 function Log  { param($Msg) Write-Host "[deploy] $Msg" -ForegroundColor Cyan }
 function Warn { param($Msg) Write-Host "[deploy] $Msg" -ForegroundColor Yellow }
 function Die  { param($Msg) Write-Host "[deploy] $Msg" -ForegroundColor Red; exit 1 }
+
+# JSON parsing helper: PS 6+ uses -AsHashtable; PS 5.1 falls back to JSS.
+# Cycle 1 surfaced that the previous JSS-only path fails on PS 7 ("Could not
+# load type 'System.Web.UI.WebResourceAttribute'"). -AsHashtable is the right
+# default on modern PowerShell; JSS only exists for PS 5.1 compatibility.
+function ConvertFrom-RunpodJson {
+    param([string] $Json)
+    if (-not $Json) { return @() }
+    if ($PSVersionTable.PSVersion.Major -ge 6) {
+        try {
+            $parsed = $Json | ConvertFrom-Json -Depth 100 -AsHashtable
+            if ($parsed -is [System.Collections.IList]) { return @($parsed) }
+            elseif ($parsed) { return @($parsed) }
+            return @()
+        } catch {
+            Warn "ConvertFrom-Json failed: $($_.Exception.Message)"
+            return @()
+        }
+    } else {
+        try {
+            Add-Type -AssemblyName System.Web.Extensions -ErrorAction Stop
+            $jss = New-Object System.Web.Script.Serialization.JavaScriptSerializer
+            $jss.MaxJsonLength = 256MB
+            $parsed = $jss.DeserializeObject($Json)
+            if ($parsed -is [System.Collections.IList]) { return @($parsed) }
+            elseif ($parsed) { return @($parsed) }
+            return @()
+        } catch {
+            Warn "JavaScriptSerializer failed: $($_.Exception.Message)"
+            return @()
+        }
+    }
+}
 
 # ─────────────────────────────────────────────────────────────
 # Pre-flight
@@ -88,7 +126,9 @@ if (-not $env:RUNPOD_API_KEY) {
             ($userOut -split "`n") | ForEach-Object { Write-Host "  | $_" }
             Die "Auth check failed."
         }
-        Log "Account: $($user.email) (balance \$$([math]::Round([double]$user.clientBalance, 2)), spend limit \$$($user.spendLimit))"
+        # Pre-compute interpolated values; PS 7 mangles the `\$$(...)` pattern.
+        $balance = [math]::Round([double]$user.clientBalance, 2)
+        Log ("Account: {0} (balance `${1}, spend limit `${2})" -f $user.email, $balance, $user.spendLimit)
     } catch {
         Warn "Could not parse runpodctl user output as JSON:"
         ($userOut -split "`n") | ForEach-Object { Write-Host "  | $_" }
@@ -142,26 +182,21 @@ if ($DataCenter -ne 'auto') {
 # ─────────────────────────────────────────────────────────────
 # Pick a data center with stock — only if we're creating a fresh volume.
 # ─────────────────────────────────────────────────────────────
+# Refreshed 2026-05-08 from the live RunPod error message. AP-JP-1, EU-SE-1,
+# EUR-IS-1, US-GA-2 dropped between 2026-05-01 and 2026-05-08 — RunPod prints
+# the live list in the volume-create error, so always re-verify when this
+# allowlist gets a hit on a stockless DC.
 $VolumeSupportedDCs = @(
-    'AP-JP-1','CA-MTL-3','CA-MTL-4','EU-CZ-1','EU-NL-1','EU-RO-1','EU-SE-1',
-    'EUR-IS-1','EUR-IS-3','EUR-NO-1','US-CA-2','US-GA-2','US-IL-1','US-KS-2',
-    'US-MO-1','US-MO-2','US-NC-2','US-NE-1','US-TX-3','US-WA-1'
+    'CA-MTL-3','CA-MTL-4','EU-CZ-1','EU-NL-1','EU-RO-1',
+    'EUR-IS-3','EUR-NO-1',
+    'US-CA-2','US-IL-1','US-KS-2','US-MO-1','US-MO-2',
+    'US-NC-2','US-NE-1','US-TX-3','US-WA-1'
 )
 
 if ($DataCenter -eq 'auto') {
     Log "Scanning datacenters for stock of '$GpuId'"
     $rawJson = (& runpodctl datacenter list -o json 2>$null) | Out-String
-    Add-Type -AssemblyName System.Web.Extensions -ErrorAction SilentlyContinue
-    $jss = New-Object System.Web.Script.Serialization.JavaScriptSerializer
-    $jss.MaxJsonLength = 256MB
-    $dcList = @()
-    try {
-        $parsed = $jss.DeserializeObject($rawJson)
-        if ($parsed -is [System.Collections.IList]) { $dcList = @($parsed) }
-        elseif ($parsed) { $dcList = @($parsed) }
-    } catch {
-        Warn "Failed to parse 'runpodctl datacenter list' JSON: $($_.Exception.Message)"
-    }
+    $dcList = ConvertFrom-RunpodJson -Json $rawJson
     Log "  parsed $($dcList.Count) datacenters"
 
     $rank = @{ 'High' = 1; 'Medium' = 2; 'Low' = 3 }
@@ -334,11 +369,16 @@ if (-not $PodId) {
 Log "Pod created: $PodId"
 Log "Waiting for pod to enter RUNNING status..."
 
+# Poll for SSH ready (not just RUNNING). The new runpodctl shape exposes
+# connection details at $podInfo.ssh.{ip,port,ssh_command} — NOT the older
+# $podInfo.runtime.ports[]. Image pulls can take 5-10 min on first deploy
+# to a DC; cap at ~5 min here.
 $podInfo = $null
-for ($i = 1; $i -le 18; $i++) {
+$sshReady = $false
+for ($i = 1; $i -le 30; $i++) {
     try {
         $podInfo = (runpodctl pod get $PodId -o json 2>$null) | ConvertFrom-Json
-        if ($podInfo.desiredStatus -eq 'RUNNING') { break }
+        if ($podInfo.ssh -and -not $podInfo.ssh.error) { $sshReady = $true; break }
     } catch { }
     Start-Sleep -Seconds 10
 }
@@ -346,24 +386,28 @@ for ($i = 1; $i -le 18; $i++) {
 # ─────────────────────────────────────────────────────────────
 # Print connection info
 # ─────────────────────────────────────────────────────────────
-$ip   = $null
-$port = $null
-if ($podInfo -and $podInfo.runtime -and $podInfo.runtime.ports) {
-    $sshPort = $podInfo.runtime.ports | Where-Object { $_.privatePort -eq 22 } | Select-Object -First 1
-    if ($sshPort) {
-        $ip   = $sshPort.ip
-        $port = $sshPort.publicPort
-    }
-}
-
 Write-Host ""
 Write-Host "[deploy] DONE" -ForegroundColor Green
 Write-Host "  pod id:     $PodId"
 Write-Host "  status:     $(if ($podInfo) { $podInfo.desiredStatus } else { '?' })"
 Write-Host "  volume id:  $VolumeId"
 Write-Host ""
-Write-Host "SSH:"
-Write-Host "  ssh root@$($ip -as [string] -or '<see-runpod-console>') -p $($port -as [string] -or '<see-runpod-console>') -i ~/.ssh/RunPod-Key-Go"
+
+if ($sshReady -and $podInfo.ssh.ip -and $podInfo.ssh.port) {
+    Write-Host "SSH:"
+    if ($podInfo.ssh.ssh_command) {
+        Write-Host "  $($podInfo.ssh.ssh_command)"
+    } else {
+        Write-Host "  ssh -i $($podInfo.ssh.ssh_key.path) -p $($podInfo.ssh.port) root@$($podInfo.ssh.ip)"
+    }
+} else {
+    Write-Host "SSH:"
+    Write-Host "  pod RUNNING but SSH not yet ready after $i polls (image probably still pulling)."
+    Write-Host "  Re-query: runpodctl pod get $PodId -o json | ConvertFrom-Json | Select-Object -Expand ssh"
+}
+Write-Host ""
+Write-Host "REMINDER: SSH port may change on stop/start (pattern bug 5 from cycle 1)."
+Write-Host "Always re-query before re-connecting after a pod stop/start."
 Write-Host ""
 Write-Host "Next steps (on the pod):"
 Write-Host "  cd /workspace"
